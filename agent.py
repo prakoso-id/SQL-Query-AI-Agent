@@ -60,6 +60,66 @@ Hasil query:
 
 Berikan penjelasan sederhana yang mudah dipahami dalam Bahasa Indonesia:"""
 
+class ReadOnlySQLDatabaseToolkit(SQLDatabaseToolkit):
+    def get_tools(self):
+        tools = super().get_tools()
+        # Only keep the query tool, remove others that might modify data
+        query_tool = [tool for tool in tools if tool.name == "sql_db_query"]
+        return query_tool
+
+def is_safe_query(query: str) -> bool:
+    """
+    Validates if the query is safe (read-only) by checking for modification keywords
+    and preventing schema access
+    """
+    # Convert query to lowercase for case-insensitive checking
+    query_lower = query.lower()
+    
+    # List of forbidden keywords that modify data or expose schema
+    forbidden_keywords = [
+        'insert', 'update', 'delete', 'drop', 'truncate', 'alter', 
+        'create', 'replace', 'upsert', 'merge', 'grant', 'revoke',
+        'information_schema', 'pg_catalog', 'pg_tables', 'pg_views',
+        'table_schema', 'column_name', 'data_type', 'table_name',
+        'pg_class', 'pg_attribute', 'pg_namespace'
+    ]
+    
+    # Check if any forbidden keyword is in the query
+    for keyword in forbidden_keywords:
+        if keyword in query_lower:
+            return False
+    
+    # Additional checks for schema-related queries
+    schema_patterns = [
+        'select.*from.*information_schema',
+        'select.*from.*pg_catalog',
+        'describe.*table',
+        'show.*tables',
+        'show.*columns',
+        'show.*schema'
+    ]
+    
+    import re
+    for pattern in schema_patterns:
+        if re.search(pattern, query_lower):
+            return False
+            
+    return True
+
+def clean_sql_query(query: str) -> str:
+    """
+    Clean and format SQL query by removing markdown formatting
+    """
+    # Remove markdown SQL formatting
+    query = query.replace('```sql', '').replace('```', '').strip()
+    
+    # Split multiple queries and take only the first one
+    # This prevents multiple statement execution
+    queries = [q.strip() for q in query.split(';') if q.strip()]
+    if queries:
+        return queries[0] + ';'
+    return ''
+
 class SQLAgent:
     def __init__(self):
         try:
@@ -100,6 +160,17 @@ class SQLAgent:
                 api_key="sk-not-needed",
                 temperature=0,
                 model_name="local-model"
+            )
+            
+            # Use custom read-only toolkit instead of default
+            self.toolkit = ReadOnlySQLDatabaseToolkit(db=self.db, llm=self.llm)
+            
+            # Create the SQL agent with the custom toolkit
+            self.agent = create_sql_agent(
+                llm=self.llm,
+                toolkit=self.toolkit,
+                verbose=True,
+                agent_type="zero-shot-react-description",
             )
             
             # Create chat prompt templates
@@ -159,8 +230,24 @@ class SQLAgent:
             logger.error(f"Error getting database schema: {str(e)}")
             return "Schema information not available"
 
+    async def _generate_sql_query(self, question: str) -> str:
+        """
+        Generate SQL query from natural language question
+        """
+        response = await self.sql_chain.ainvoke({
+            "question": question,
+            "db_schema": self.db_schema
+        })
+        
+        if not response or "text" not in response:
+            return ""
+            
+        return response["text"].strip()
+
     async def elaborate_results(self, question: str, sql_query: str, results: list) -> str:
-        """Elaborate query results using LLM"""
+        """
+        Elaborate query results using LLM
+        """
         try:
             # Convert results to a readable format with custom encoder for Decimal
             results_str = json.dumps(results, indent=2, ensure_ascii=False, cls=DecimalEncoder)
@@ -184,57 +271,89 @@ class SQLAgent:
             logger.error(f"Error elaborating results: {str(e)}")
             return f"Error dalam mengelaborasi hasil: {str(e)}"
 
-    async def process_query(self, user_input: str) -> Dict[str, Any]:
+    async def process_query(self, question: str) -> Dict[str, Any]:
+        """
+        Process a natural language query and return the results
+        """
         try:
-            if not user_input:
-                return {"status": "error", "message": "Query cannot be empty"}
-                
-            logger.info(f"Processing query: {user_input}")
+            # Generate SQL query from natural language
+            logger.info("Generating SQL query")
+            sql_query = await self._generate_sql_query(question)
             
-            # Generate SQL query using the LLM
-            response = await self.sql_chain.ainvoke({
-                "question": user_input,
-                "db_schema": self.db_schema
-            })
+            # Clean the SQL query
+            sql_query = clean_sql_query(sql_query)
             
-            if not response or "text" not in response:
-                return {"status": "error", "message": "Failed to generate SQL query"}
+            if not sql_query:
+                return {
+                    "status": "error",
+                    "message": "Maaf saya tidak bisa menemukan jawaban dari pertanyaan anda"
+                }
             
-            sql_query = response["text"].strip()
             logger.info(f"Generated SQL query: {sql_query}")
             
             # Execute the SQL query
             try:
-                # Use SQLAlchemy text() to ensure proper SQL execution
+                # Validate query before execution
+                if not is_safe_query(sql_query):
+                    logger.warning(f"Forbidden query attempted: {sql_query}")
+                    return {
+                        "status": "error",
+                        "message": "Maaf saya tidak bisa menemukan jawaban dari pertanyaan anda"
+                    }
+                    
                 with self.engine.connect() as connection:
                     result = connection.execute(text(sql_query))
-                    # Convert result to list of dictionaries and handle Decimal
                     columns = result.keys()
-                    rows = []
-                    for row in result.fetchall():
-                        row_dict = {}
-                        for col, val in zip(columns, row):
-                            if isinstance(val, Decimal):
-                                row_dict[col] = str(val)
-                            else:
-                                row_dict[col] = val
-                        rows.append(row_dict)
+                    rows = [dict(zip(columns, row)) for row in result.fetchall()]
                     
                 # Elaborate results using LLM
-                elaboration = await self.elaborate_results(user_input, sql_query, rows)
-                    
+                elaboration = await self.elaborate_results(question, sql_query, rows)
+                
                 return {
                     "status": "success",
-                    "data": elaboration
+                    "results": elaboration
                 }
-            except Exception as db_error:
-                logger.error(f"Database error: {str(db_error)}")
+                
+            except Exception as e:
+                logger.error(f"Database error: {str(e)}")
                 return {
                     "status": "error",
-                    "message": f"Database error: {str(db_error)}",
-                    "sql_query": sql_query
+                    "message": "Maaf saya tidak bisa menemukan jawaban dari pertanyaan anda"
                 }
-            
+                
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}")
-            return {"status": "error", "message": str(e)}
+            return {
+                "status": "error",
+                "message": "Maaf saya tidak bisa menemukan jawaban dari pertanyaan anda"
+            }
+
+    def execute_query(self, query: str) -> Dict[str, Any]:
+        """
+        Execute a SQL query and return the results
+        """
+        try:
+            # Validate query before execution
+            if not is_safe_query(query):
+                logger.warning(f"Forbidden query attempted: {query}")
+                return {
+                    "status": "error",
+                    "message": "Maaf saya tidak bisa menemukan jawaban dari pertanyaan anda"
+                }
+                
+            with self.engine.connect() as connection:
+                result = connection.execute(text(query))
+                columns = result.keys()
+                rows = [dict(zip(columns, row)) for row in result.fetchall()]
+                
+            return {
+                "status": "success",
+                "results": rows
+            }
+            
+        except Exception as e:
+            logger.error(f"Error executing query: {str(e)}")
+            return {
+                "status": "error",
+                "message": "Maaf saya tidak bisa menemukan jawaban dari pertanyaan anda"
+            }
