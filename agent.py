@@ -5,60 +5,175 @@ from langchain_openai import ChatOpenAI
 from langchain.agents import AgentExecutor
 from langchain.chains.llm import LLMChain
 from langchain.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, SystemMessagePromptTemplate
-from dotenv import load_dotenv
 import os
 import logging
 from typing import Dict, Any
 from sqlalchemy import inspect, text, create_engine
 import json
 from decimal import Decimal
+from datetime import datetime
+import sys
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables
-load_dotenv()
+# Debug: Print environment variables (excluding sensitive info)
+logger.info("Checking environment variables...")
+logger.info(f"LOCAL_LLM_BASE_URL: {os.getenv('LOCAL_LLM_BASE_URL')}")
+logger.info(f"API_KEY exists: {bool(os.getenv('API_KEY'))}")
 
 class DecimalEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, Decimal):
             return str(obj)
+        if isinstance(obj, datetime):
+            return obj.isoformat()
         return super(DecimalEncoder, self).default(obj)
 
 # Define a custom prompt template for SQL queries
-SYSTEM_TEMPLATE = """You are a SQL expert. Your task is to convert natural language questions into PostgreSQL queries.
-You should only respond with the SQL query, nothing else.
+SYSTEM_TEMPLATE = """You are a SQL expert. Your task is to convert natural language questions into simple and efficient PostgreSQL queries.
 
-Available tables and their schemas:
-{db_schema}"""
+CORE PRINCIPLES:
+1. Keep queries SIMPLE - avoid complexity when possible
+2. Use straightforward patterns that are easy to understand
+3. Include relevant columns in the output
+4. Add clear column aliases when needed
 
-HUMAN_TEMPLATE = """Given this question and the available database schema, generate the appropriate PostgreSQL query.
-Think through this step by step:
-1. Look at the available tables and their columns
-2. Identify the relevant tables needed for this query
-3. Consider any necessary date/time functions for temporal queries
-4. Build the appropriate SQL query
+COMMON QUERY PATTERNS:
+
+1. Finding Maximum/Minimum:
+   ```sql
+   -- Single column
+   SELECT *
+   FROM [table]
+   WHERE [column] = (SELECT MAX/MIN([column]) FROM [table])
+   LIMIT 1;
+
+   -- With additional sorting
+   SELECT *
+   FROM [table]
+   WHERE [column1] = (SELECT MAX/MIN([column1]) FROM [table])
+   ORDER BY [column2] DESC/ASC
+   LIMIT 1;
+   ```
+
+2. Filtering with Multiple Conditions:
+   ```sql
+   SELECT *
+   FROM [table]
+   WHERE [condition1]
+   AND/OR [condition2]
+   ORDER BY [column] DESC/ASC;
+   ```
+
+3. Top N Records:
+   ```sql
+   SELECT *
+   FROM [table]
+   ORDER BY [column] DESC/ASC
+   LIMIT N;
+   ```
+
+4. Range Queries:
+   ```sql
+   SELECT *
+   FROM [table]
+   WHERE [column] BETWEEN [value1] AND [value2]
+   ORDER BY [column];
+   ```
+
+Available Database Schema:
+{db_schema}
+
+GUIDELINES:
+1. Use subqueries for finding maximum/minimum values
+2. Add ORDER BY when additional sorting is needed
+3. Use LIMIT to restrict number of results
+4. Always validate column names against the schema
+
+Return ONLY the SQL query without any explanation."""
+
+HUMAN_TEMPLATE = """Follow these steps to generate an accurate query:
+
+1. ANALYZE the question:
+   - What is being asked for?
+   - What conditions are specified?
+   - What type of result is expected?
+
+2. IDENTIFY key elements:
+   - Required tables and columns
+   - Filter conditions
+   - Sorting requirements
+   - Expected result format
+
+3. CHOOSE appropriate query pattern:
+   - Extremes (MAX/MIN)
+   - Filtering
+   - Aggregation
+   - Range
+   - Pattern matching
+   - Ranking
+
+4. ADAPT the pattern:
+   - Replace placeholders
+   - Add specific conditions
+   - Include relevant columns
+   - Set proper ordering
+
+5. VALIDATE the query:
+   - Check column names
+   - Verify conditions
+   - Confirm sorting
+   - Ensure result format
 
 Question: {question}
 
-Generate only the SQL query, no other text:"""
+Generate the SQL query:"""
 
-RESULT_ELABORATION_SYSTEM = """Kamu adalah asisten yang membantu menjelaskan data dengan bahasa yang sangat sederhana.
-Tugas kamu adalah:
+RESULT_ELABORATION_SYSTEM = """You are an assistant who explains data in a simple and clear way.
+
+IMPORTANT: Detect the language of the question and respond in the SAME LANGUAGE.
+- If the question is in Indonesian, respond in Indonesian
+- If the question is in English, respond in English
+
+Guidelines for Indonesian responses:
 1. Berikan jawaban langsung sesuai pertanyaan
 2. Gunakan bahasa sehari-hari yang mudah dipahami
 3. Hindari istilah teknis atau jargon
 4. Buat penjelasan singkat, padat, dan jelas
 5. Fokus hanya pada informasi yang ditanyakan
-6. Selalu gunakan sentimen yang positif"""
+6. Selalu gunakan sentimen yang positif
 
-RESULT_ELABORATION_HUMAN = """Pertanyaan: {question}
+Guidelines for English responses:
+1. Provide a direct answer to the question
+2. Use everyday language that is easy to understand
+3. Avoid technical terms or jargon
+4. Make explanations brief, concise, and clear
+5. Focus only on the requested information
+6. Always use a positive tone
 
-Hasil query:
+Example responses:
+[Indonesian]
+Q: "produk dengan harga tertinggi?"
+A: "Produk [nama] memiliki harga tertinggi sebesar Rp [harga]"
+
+[English]
+Q: "product with highest price?"
+A: "The product [name] has the highest price at $[price]"
+
+Remember: ALWAYS respond in the SAME LANGUAGE as the question!"""
+
+RESULT_ELABORATION_HUMAN = """Question/Pertanyaan: {question}
+
+Query executed:
+{sql_query}
+
+Results/Hasil:
 {results}
 
-Berikan penjelasan sederhana yang mudah dipahami dalam Bahasa Indonesia:"""
+Please provide a simple explanation in the same language as the question:"""
 
 class ReadOnlySQLDatabaseToolkit(SQLDatabaseToolkit):
     def get_tools(self):
@@ -151,15 +266,32 @@ class SQLAgent:
             
             # Initialize LLM with local LM Studio
             llm_base_url = os.getenv("LOCAL_LLM_BASE_URL")
+            llm_api_key = os.getenv("API_KEY")
+            llm_model = os.getenv("LLM_MODEL")
+
+
             if not llm_base_url:
                 raise ValueError("LOCAL_LLM_BASE_URL environment variable is not set")
+            if not llm_api_key:
+                raise ValueError("API_KEY environment variable is not set")
+            if not llm_model:
+                raise ValueError("LLM_MODEL environment variable is not set")
                 
             logger.info(f"Initializing ChatLLM with base URL: {llm_base_url}")
+            
+            # Configure headers for OpenRouter
+            headers = {
+                "HTTP-Referer": "https://github.com/prakoso-id",  # Your website URL
+                "X-Title": "SQL Query AI Agent"  # Your app name
+            }
+            
             self.llm = ChatOpenAI(
                 base_url=f"{llm_base_url}/v1",
-                api_key="sk-not-needed",
+                api_key=llm_api_key,
                 temperature=0,
-                model_name="local-model"
+                model_name=llm_model,  # OpenRouter model name
+                streaming=True,      # Enable streaming for faster first tokens
+                default_headers=headers  # Add OpenRouter specific headers
             )
             
             # Use custom read-only toolkit instead of default
@@ -249,27 +381,33 @@ class SQLAgent:
         Elaborate query results using LLM
         """
         try:
-            # Convert results to a readable format with custom encoder for Decimal
-            results_str = json.dumps(results, indent=2, ensure_ascii=False, cls=DecimalEncoder)
+            # Convert results to a more readable format
+            formatted_results = json.dumps(results, indent=2, cls=DecimalEncoder)
             
-            # Get elaboration from LLM
-            response = await self.elaboration_chain.ainvoke({
+            # Create input dictionary for chain
+            chain_input = {
                 "question": question,
                 "sql_query": sql_query,
-                "results": results_str
-            })
+                "results": formatted_results
+            }
+
+            # Get elaboration from LLM using ainvoke
+            elaboration_response = await self.elaboration_chain.ainvoke(chain_input)
             
-            if not response or "text" not in response:
-                return "Tidak dapat mengelaborasi hasil query"
-                
-            # Ensure response is not longer than 200 characters
-            elaboration = response["text"].strip()
-                
-            return elaboration
-            
+            if not elaboration_response or not elaboration_response.get("text"):
+                # Fallback response in Indonesian (since most questions are in Indonesian)
+                if not results:
+                    return "Maaf, tidak ada data yang ditemukan untuk pertanyaan ini."
+                return "Ditemukan data sesuai pertanyaan, tetapi tidak bisa memberikan penjelasan detail."
+
+            return elaboration_response["text"].strip()
+
         except Exception as e:
             logger.error(f"Error elaborating results: {str(e)}")
-            return f"Error dalam mengelaborasi hasil: {str(e)}"
+            # Fallback response
+            if results:
+                return json.dumps(results, indent=2, cls=DecimalEncoder)
+            return "Maaf, terjadi kesalahan saat memproses penjelasan hasil."
 
     async def process_query(self, question: str) -> Dict[str, Any]:
         """
@@ -282,13 +420,6 @@ class SQLAgent:
             
             # Clean the SQL query
             sql_query = clean_sql_query(sql_query)
-            
-            if not sql_query:
-                return {
-                    "status": "error",
-                    "message": "Maaf saya tidak bisa menemukan jawaban dari pertanyaan anda"
-                }
-            
             logger.info(f"Generated SQL query: {sql_query}")
             
             # Execute the SQL query
@@ -298,34 +429,35 @@ class SQLAgent:
                     logger.warning(f"Forbidden query attempted: {sql_query}")
                     return {
                         "status": "error",
-                        "message": "Maaf saya tidak bisa menemukan jawaban dari pertanyaan anda"
+                        "message": "Query tidak diizinkan karena alasan keamanan."
                     }
                     
                 with self.engine.connect() as connection:
                     result = connection.execute(text(sql_query))
                     columns = result.keys()
                     rows = [dict(zip(columns, row)) for row in result.fetchall()]
+                    logger.info(f"Query result: {rows}")
+
+                    # Elaborate results using LLM
+                    elaboration = await self.elaborate_results(question, sql_query, rows)
                     
-                # Elaborate results using LLM
-                elaboration = await self.elaborate_results(question, sql_query, rows)
-                
-                return {
-                    "status": "success",
-                    "results": elaboration
-                }
+                    return {
+                        "status": "success",
+                        "results": elaboration
+                    }
                 
             except Exception as e:
                 logger.error(f"Database error: {str(e)}")
                 return {
                     "status": "error",
-                    "message": "Maaf saya tidak bisa menemukan jawaban dari pertanyaan anda"
+                    "message": f"Error saat mengakses database: {str(e)}"
                 }
                 
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}")
             return {
                 "status": "error",
-                "message": "Maaf saya tidak bisa menemukan jawaban dari pertanyaan anda"
+                "message": f"Error saat memproses query: {str(e)}"
             }
 
     def execute_query(self, query: str) -> Dict[str, Any]:
@@ -338,7 +470,7 @@ class SQLAgent:
                 logger.warning(f"Forbidden query attempted: {query}")
                 return {
                     "status": "error",
-                    "message": "Maaf saya tidak bisa menemukan jawaban dari pertanyaan anda"
+                    "message": "Query tidak diizinkan karena alasan keamanan."
                 }
                 
             with self.engine.connect() as connection:
@@ -355,5 +487,5 @@ class SQLAgent:
             logger.error(f"Error executing query: {str(e)}")
             return {
                 "status": "error",
-                "message": "Maaf saya tidak bisa menemukan jawaban dari pertanyaan anda"
+                "message": f"Error saat mengakses database: {str(e)}"
             }
